@@ -1,0 +1,16 @@
+# Локальные настройки и журналы с реальной кассы: в репозиторий не попадают
+config.json
+fixes.log
+*.zip
+*.bak-*
+
+# Сборка
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
