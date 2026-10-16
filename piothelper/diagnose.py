@@ -250,6 +250,134 @@ def check_versions(cfg: dict) -> list[Finding]:
     return out
 
 
+# ---------- внешние адреса ----------
+
+def _probe(host: str, port: int, timeout: float = 3.0) -> tuple[bool, str]:
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True, ""
+    except socket.gaierror:
+        return False, "имя не разрешается (DNS)"
+    except socket.timeout:
+        return False, "таймаут (порт, вероятно, закрыт файрволом)"
+    except OSError as e:
+        return False, e.strerror or "ошибка соединения"
+
+
+def check_external(cfg: dict) -> list[Finding]:
+    """Доступны ли внешние адреса, без которых ЕСМ не проверит код и не получит лицензию."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = [(group, h, p) for group, hosts in knowledge.EXTERNAL_HOSTS.items() for h, p in hosts]
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        results = list(ex.map(lambda j: _probe(j[1], j[2]), jobs))
+    by_group: dict[str, list[tuple[str, int, bool, str]]] = {}
+    for (group, h, p), (ok, why) in zip(jobs, results):
+        by_group.setdefault(group, []).append((h, p, ok, why))
+    if not any(ok for rows in by_group.values() for _, _, ok, _ in rows):
+        return [Finding(FAIL, "Нет доступа к внешним адресам ЕСМ (ЦРПТ, ЕСП)",
+                        "Недоступен ни один из проверяемых адресов: нет интернета, DNS или всё закрыто файрволом. "
+                        "Проверьте подключение и попросите администратора сети разрешить исходящие TCP-соединения: "
+                        + "; ".join(f"{h}:{p}" for rows in by_group.values() for h, p, _, _ in rows[:1]) + " и др.")]
+    out = []
+    for group, rows in by_group.items():
+        good = [r for r in rows if r[2]]
+        bad = [r for r in rows if not r[2]]
+        ports = sorted({r[1] for r in rows})
+        if group.startswith("Серверы") and good:  # серверов проверки много, нужен хотя бы один; остальные адреса обязательны
+            lvl = OK if len(good) == len(rows) else INFO
+            out.append(Finding(lvl, f"{group}: доступно {len(good)} из {len(rows)} (порт {ports[0]})",
+                               "; ".join(f"{h}: {why}" for h, _, _, why in bad)))
+        elif not bad:
+            out.append(Finding(OK, f"{group}: доступно ({', '.join(f'{h}:{p}' for h, p, _, _ in rows)})"))
+        else:
+            hosts = ", ".join(f"{h}:{p}" for h, p, _, _ in bad)
+            why = "; ".join(sorted({w for *_, w in bad}))
+            out.append(Finding(FAIL, f"{group}: недоступно ({hosts})",
+                               f"{why}. Это частая причина ошибок 514/403: попросите администратора сети или провайдера "
+                               "открыть исходящие соединения к этим адресам."))
+    return out
+
+
+# ---------- смена ----------
+
+SHIFT_RE = re.compile(r"shiftStatus\W{1,6}\{(.*?)\}", re.S)
+
+
+def check_shift(cfg: dict) -> list[Finding]:
+    """ЕСМ требует смену младше 24 часов. Берём последнюю запись getShiftStatus из свежего лога драйвера."""
+    for entry in cfg["paths"]:
+        if entry["kind"] != "log":
+            continue
+        for f in logs.list_log_files(entry["path"].strip())[:3]:
+            if "fptr" not in f.name.lower():
+                continue
+            try:
+                text = "\n".join(logs.read_tail(f, cfg["tail_kb"]))
+                age = logs.file_age_minutes(f)
+            except OSError:
+                continue
+            ms = list(SHIFT_RE.finditer(text))
+            if not ms:
+                continue
+            body = ms[-1].group(1)
+            state = (re.search(r"state\W{1,6}(\w+)", body) or [None, ""])[1]
+            number = (re.search(r"number\W{1,6}(\d+)", body) or [None, "?"])[1]
+            exp = re.search(r"expiredTime\W{1,6}(\d{4}-\d{2}-\d{2}T[\d:]+(?:[+-]\d{2}:\d{2}|Z)?)", body)
+            if age > 60:
+                return [Finding(INFO, "Смена не проверена: лог драйвера давно не обновлялся", str(f))]
+            if state == "closed":
+                return [Finding(INFO, f"Смена закрыта (по логу драйвера {f.name})",
+                                "Откройте смену: проверка кодов и регистрация ЕСМ работают только при открытой смене.")]
+            if state == "expired" or not exp:
+                return [Finding(FAIL if state == "expired" else INFO, f"Смена №{number}: состояние «{state or '?'}»",
+                                "Смена истекла (больше 24 ч): закройте её и откройте новую.")]
+            end = datetime.datetime.fromisoformat(exp.group(1).replace("Z", "+00:00"))
+            now = datetime.datetime.now(end.tzinfo) if end.tzinfo else datetime.datetime.now()
+            left = (end - now).total_seconds() / 3600
+            if left <= 0:
+                return [Finding(FAIL, f"Смена №{number} истекла {-left:.0f} ч назад",
+                                "Смена дольше 24 часов: закройте и откройте новую, иначе проверка маркировки и регистрация "
+                                "ЕСМ работать не будут.")]
+            if left < knowledge.SHIFT_WARN_HOURS:
+                return [Finding(WARN, f"Смена №{number} закончится через {left * 60:.0f} мин",
+                                "Закройте и откройте смену заранее, чтобы не потерять проверку марок.")]
+            return [Finding(OK, f"Смена №{number} открыта, до конца 24 ч осталось {left:.0f} ч")]
+    return [Finding(INFO, "Смена не проверена", "В логах драйвера (fptr10) нет данных о смене или лог не указан.")]
+
+
+# ---------- версия ЕСМ ----------
+
+def check_esm_version(cfg: dict) -> list[Finding]:
+    """Версия ЕСМ по файлам служб esm-*. Рекомендуется 1.6.4+."""
+    script = ("Get-CimInstance Win32_Service | Where-Object { $_.Name -like 'esm-*' } | "
+              "Select-Object Name,PathName | ConvertTo-Json -Compress")
+    raw = fixes.ps(script, timeout=40)
+    if not raw:
+        return []
+    rows = json.loads(raw)
+    rows = [rows] if isinstance(rows, dict) else rows
+    versions = {}
+    for r in rows:
+        m = re.match(r'\s*"([^"]+)"|\s*(\S+?\.exe)', r.get("PathName") or "", re.I)
+        exe = (m.group(1) or m.group(2)) if m else ""
+        if not exe or not Path(exe).is_file():
+            continue
+        try:
+            v = _ver(fixes.ps("(Get-Item -LiteralPath $env:PIOT_ARG).VersionInfo.FileVersion", exe))
+        except Exception:  # noqa: BLE001
+            continue
+        if v:
+            versions[r["Name"]] = v
+    if not versions:
+        return [Finding(INFO, "Версия ЕСМ не определена", "У файлов служб esm-* нет информации о версии.")]
+    low = min(versions.values())
+    shown = ", ".join(f"{n}: {_fmt(v)}" for n, v in versions.items())
+    if low < knowledge.MIN_ESM_VERSION:
+        return [Finding(WARN, f"ЕСМ {_fmt(low)} старее рекомендуемой {_fmt(knowledge.MIN_ESM_VERSION)}", shown +
+                        "\nОбновите ЕСМ и контроллер (сначала их, и только потом ЛМ ЧЗ).")]
+    return [Finding(OK, f"ЕСМ {_fmt(low)} (рекомендуется {_fmt(knowledge.MIN_ESM_VERSION)}+)", shown)]
+
+
 # ---------- прокси ----------
 
 def check_proxy(cfg: dict) -> list[Finding]:
@@ -328,7 +456,8 @@ def check_logs(cfg: dict) -> list[Finding]:
 
 CHECKS = [
     ("Службы", check_services), ("Порты", check_ports), ("Время", check_time), ("Сертификаты", check_certs),
-    ("Конфиг ЕСМ", check_esm_config), ("Версии", check_versions), ("Прокси", check_proxy), ("Логи", check_logs),
+    ("Конфиг ЕСМ", check_esm_config), ("Версии", check_versions), ("Версия ЕСМ", check_esm_version),
+    ("Внешние адреса", check_external), ("Смена", check_shift), ("Прокси", check_proxy), ("Логи", check_logs),
 ]
 ORDER = {FAIL: 0, WARN: 1, INFO: 2, OK: 3}
 
