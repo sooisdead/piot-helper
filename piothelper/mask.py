@@ -14,8 +14,8 @@ from typing import Iterable
 
 # (категория, шаблон). Порядок важен: сначала секреты и коды маркировки, потом общие числа.
 SECRET_KV = re.compile(
-    r'(?i)("?\b(?:token|password|passwd|pwd|secret|api[_-]?key|authorization|x-clientid|x-api-key|access[_-]?key|'
-    r'client[_-]?secret)\b"?\s*[:=]\s*"?)([^"\s,;}&]{3,})')
+    r'(?i)(\b(?:token|password|passwd|pwd|secret|api[_-]?key|authorization|x-clientid|x-api-key|access[_-]?key|'
+    r'client[_-]?secret)\b\\?"?\s*[:=]\s*\\?"?(?:(?:bearer|basic|token)\s+)?)([^"\\\s,;}&]{3,})')  # и в экранированном JSON, и «Bearer …»
 KM_PLAIN = re.compile(r"01\d{14}21[\x21-\x7e\x1d]{1,40}")      # код маркировки: 01+GTIN+21+серийный номер…
 KM_B64 = re.compile(r"MDEw[A-Za-z0-9+/]{20,}={0,2}")           # он же в base64 (так его присылает Frontol)
 LICENSE_KEY = re.compile(r"\b[0-9A-Z]{5}-[0-9A-Z]{5}-[0-9A-Z]{5}\b")

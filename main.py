@@ -4,6 +4,7 @@ if __name__ == "__main__":
     # Служебные режимы (нужны собранному exe: запускает сам себя вместо python):
     #   --handles [--out файл] COM5 …   поиск процессов, держащих COM-порт
     #   --selftest --out файл           самопроверка без окна
+    #   --tray                          запуск из автозапуска: окно свёрнуто в значок (если включена фоновая проверка)
     if sys.argv[1:2] == ["--handles"]:
         from piothelper import handles
         handles.main(sys.argv[2:])
@@ -12,4 +13,4 @@ if __name__ == "__main__":
         selftest.run(sys.argv[sys.argv.index("--out") + 1])
     else:
         from piothelper.gui import run
-        run()
+        run(start_hidden="--tray" in sys.argv[1:])

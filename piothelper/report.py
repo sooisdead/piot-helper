@@ -5,7 +5,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, checks, diagnose, logs
+from . import __version__, checks, diagnose, logs, timeline
 from .mask import Masker
 
 MARK = {checks.OK: "[ OK ]", checks.WARN: "[WARN]", checks.FAIL: "[FAIL]", checks.INFO: "[INFO]"}
@@ -37,9 +37,17 @@ def build_report(cfg: dict, out_path: Path, mask: bool | None = None) -> str:
         f"{MARK.get(f.level, '[    ]')} {f.title}" + (f"\n        {f.detail.replace(chr(10), chr(10) + '        ')}" if f.detail else "")
         for f in findings) + "\n"
 
+    try:
+        hours = cfg.get("stats_hours", 24)
+        events = timeline.collect(cfg, hours, "warn", limit=500)
+        timeline_text = (f"Хронология предупреждений и ошибок за последние {hours} ч (повторы свёрнуты)\n\n" +
+                         (timeline.format_events(events) or "Событий нет.\n"))
+    except Exception as e:  # noqa: BLE001 — отчёт важнее хронологии
+        timeline_text = f"Хронологию построить не удалось: {e}\n"
     entries: list[tuple[str, str]] = [
         ("summary.txt", summary_text),
         ("diagnostics.txt", "Результат диагностики (вкладка «Исправления»)\n\n" + diag_text),
+        ("timeline.txt", timeline_text),
         ("config.json", json.dumps(cfg, ensure_ascii=False, indent=2)),
     ]
     for entry in cfg["paths"]:

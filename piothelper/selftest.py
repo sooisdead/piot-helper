@@ -2,7 +2,7 @@
 import json
 import sys
 
-from . import __version__, checks, config, discover, portowner
+from . import __version__, checks, config, discover, knowledge, portowner, tray
 
 
 def run(out_path: str) -> None:
@@ -23,6 +23,14 @@ def run(out_path: str) -> None:
     step("com_owner_scan_NUL", scan)
     step("tcp_owners_135", lambda: len(portowner.tcp_owners("", 135)))
     step("discover_known_keywords", lambda: discover.product_of("ProgramData\\ESP\\ESM", cfg))
+    step("rules", lambda: len(knowledge.RULES))  # 0 — значит, rules.json не попал в сборку
+
+    def tray_check():
+        icon = tray.Tray(lambda: None, lambda: None, lambda: None)
+        ok = icon.start()
+        icon.stop()
+        return bool(ok)
+    step("tray_window", tray_check)
     step("is_admin", portowner.is_admin)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(res, f, ensure_ascii=False, indent=1)

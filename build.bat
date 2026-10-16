@@ -12,6 +12,7 @@ if errorlevel 1 (
 )
 
 %PY% -m PyInstaller --noconfirm --clean --onefile --windowed --name PIoTHelper ^
+  --add-data "%~dp0piothelper\rules.json;piothelper" ^
   --distpath dist --workpath build --specpath build main.py || goto :fail
 
 echo.

@@ -1,0 +1,59 @@
+name: Build exe
+
+# По тегу vX.Y.Z собирает PIoTHelper.exe из исходников и прикладывает к релизу вместе с SHA-256.
+# Вручную (Run workflow) только собирает файл и сохраняет его как артефакт — релиз не создаётся.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: python -m pip install -r requirements-dev.txt pyinstaller
+      - name: Run tests
+        run: python -m pytest -p no:cacheprovider
+      - name: Build exe
+        run: >
+          python -m PyInstaller --noconfirm --clean --onefile --windowed --name PIoTHelper
+          --add-data "${{ github.workspace }}\piothelper\rules.json;piothelper"
+          --distpath dist --workpath build --specpath build main.py
+      - name: Self-test the exe
+        run: |
+          dist\PIoTHelper.exe --selftest --out selftest.json
+          Get-Content selftest.json
+          $j = Get-Content selftest.json -Raw | ConvertFrom-Json
+          if (-not $j.frozen -or $j.discover_known_keywords -ne "ТС ПИоТ") { throw "selftest failed" }
+          if ($j.rules -lt 30) { throw "rules.json is missing from the build (rules=$($j.rules))" }
+      - name: SHA-256
+        id: hash
+        run: |
+          $h = (Get-FileHash dist\PIoTHelper.exe -Algorithm SHA256).Hash
+          "sha=$h" >> $env:GITHUB_OUTPUT
+          Write-Host "SHA-256: $h"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PIoTHelper-exe
+          path: dist/PIoTHelper.exe
+      - name: Publish to the release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          SHA: ${{ steps.hash.outputs.sha }}
+        run: |
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG dist\PIoTHelper.exe --clobber
+          } else {
+            gh release create $env:TAG dist\PIoTHelper.exe --title "PIoT Helper $env:TAG" --notes "Собрано автоматически из исходников (GitHub Actions). SHA-256: ``$env:SHA``"
+          }

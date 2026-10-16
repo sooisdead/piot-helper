@@ -67,6 +67,15 @@ DEFAULT_CONFIG = {
     "mask_report": True,
     # Свои слова для маскирования (название организации, адрес, фамилия): заменяются на [NAME…].
     "mask_extra": [],
+    # Фоновая проверка с уведомлениями в трее.
+    "monitor_enabled": False,
+    "monitor_minutes": 15,          # как часто проверять (не реже 5)
+    "monitor_notify_warn": False,   # уведомлять и о предупреждениях, а не только об ошибках
+    "monitor_repeat_hours": 6,      # одну и ту же проблему повторно показывать не чаще
+    # Адрес файла правил для кнопки «Обновить правила» (только https и только GitHub).
+    "rules_url": "https://raw.githubusercontent.com/sooisdead/piot-helper/main/piothelper/rules.json",
+    # За сколько часов считать статистику проверок марок и хронологию в отчёте.
+    "stats_hours": 24,
     # Ошибки в логах считаются только за последние N часов (если в логе есть метки времени).
     "recent_hours": 48,
     # Разовый сбой, не повторявшийся дольше N минут, считается устранённым (показывается как информация).
@@ -113,7 +122,7 @@ def load() -> dict:
     cfg = copy.deepcopy(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
-            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))  # sig: файл из Блокнота/PowerShell бывает с BOM
             cfg.update(saved)
             if saved.get("defaults_version", 1) < DEFAULT_CONFIG["defaults_version"]:
                 _merge_new_defaults(cfg)

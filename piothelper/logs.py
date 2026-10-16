@@ -1,6 +1,6 @@
 """Чтение и классификация логов."""
 import re
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 LOG_SUFFIXES = {".log", ".txt", ".json", ".jsonl", ".out", ".err", ".trace"}
@@ -46,17 +46,28 @@ def read_tail(path: Path, max_kb: int) -> list[str]:
 
 # «Ошибки нет» в разных видах: "error" : 0, errorCode=0, «Ошибок нет» — это не ошибки.
 NO_ERROR = re.compile(r'"?(?:error|errorcode)"?\s*[:=]\s*0\b|ошибок нет', re.I)
-TIMESTAMP = re.compile(r"(\d{4})[-./](\d{2})[-./](\d{2})[ T](\d{2}):(\d{2}):(\d{2})")
+TIMESTAMP = re.compile(r"(\d{4})[-./](\d{2})[-./](\d{2})[ T](\d{2}):(\d{2}):(\d{2})(?:[.,]\d+)?(Z|[+-]\d{2}:?\d{2})?")
 
 
 def line_time(line: str) -> datetime | None:
+    """Время записи, приведённое к местному (naive). Метки с «Z»/смещением (логи ЛМ ЧЗ пишут в UTC) пересчитываются."""
     m = TIMESTAMP.search(line)
     if not m:
         return None
     try:
-        return datetime(*map(int, m.groups()))
+        dt = datetime(*map(int, m.groups()[:6]))
     except ValueError:
         return None
+    tz = m.group(7)
+    if not tz:
+        return dt
+    if tz == "Z":
+        offset = timezone.utc
+    else:
+        sign = 1 if tz[0] == "+" else -1
+        digits = tz[1:].replace(":", "")
+        offset = timezone(sign * timedelta(hours=int(digits[:2]), minutes=int(digits[2:])))
+    return dt.replace(tzinfo=offset).astimezone().replace(tzinfo=None)
 
 
 def recent_lines(lines: list[str], hours: float) -> tuple[list[str], bool]:

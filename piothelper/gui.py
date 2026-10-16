@@ -8,7 +8,9 @@ from tkinter import filedialog, messagebox, ttk
 
 from datetime import datetime
 
-from . import __version__, checks, config, diagnose, discover, fixes, knowledge, logs, portowner, report, restart
+from . import (__version__, checks, config, diagnose, discover, fixes, history, knowledge, logs, monitor, portowner,
+               report, restart, tray)
+from .gui_extra import SettingsTab, TimelineTab
 
 COLORS = {checks.OK: "#1a7f37", checks.WARN: "#9a6700", checks.FAIL: "#cf222e", checks.INFO: "#57606a"}
 ICONS = {checks.OK: "✔", checks.WARN: "⚠", checks.FAIL: "✖", checks.INFO: "ℹ"}
@@ -33,14 +35,85 @@ class App(tk.Tk):
         self.ports_tab = PortsTab(nb, self)
         self.owner_tab = PortOwnerTab(nb, self)
         self.logs_tab = LogsTab(nb, self)
+        self.timeline_tab = TimelineTab(nb, self)
+        self.settings_tab = SettingsTab(nb, self)
         for tab, title in [
-            (self.summary_tab, "Сводка"), (self.fix_tab, "Исправления"), (self.paths_tab, "Пути"), (self.services_tab, "Службы"),
-            (self.ports_tab, "Порты"), (self.owner_tab, "Порт ККМ"), (self.logs_tab, "Логи"),
+            (self.summary_tab, "Сводка"), (self.fix_tab, "Исправления"), (self.timeline_tab, "Хронология"),
+            (self.paths_tab, "Пути"), (self.services_tab, "Службы"), (self.ports_tab, "Порты"),
+            (self.owner_tab, "Порт ККМ"), (self.logs_tab, "Логи"), (self.settings_tab, "Настройки"),
         ]:
             nb.add(tab, text=title)
 
+        self.tray: tray.Tray | None = None
+        self.monitor = monitor.Monitor(lambda: self.cfg, self._monitor_notify, self._monitor_result)
+        self._hint_shown = False
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.apply_monitor_settings()
+
     def save(self):
         config.save(self.cfg)
+
+    # ----- фоновая проверка и значок в трее -----
+
+    def apply_monitor_settings(self):
+        """Включает или выключает фоновую проверку и значок согласно настройкам."""
+        if self.cfg.get("monitor_enabled"):
+            if self.tray is None:
+                icon = tray.Tray(lambda: self.ui(self.show_window), self.monitor_run_now, lambda: self.ui(self.shutdown),
+                                 "PIoT Helper: проверка в фоне")
+                if icon.start():
+                    self.tray = icon
+                else:
+                    self.settings_tab.set_monitor_status("Значок в области уведомлений создать не удалось: уведомлений не будет.")
+            self.monitor.start()
+            self.settings_tab.set_monitor_status("Фоновая проверка включена: первая проверка через ~20 секунд.")
+        else:
+            self.monitor.stop()
+            if self.tray is not None:
+                self.tray.stop()
+                self.tray = None
+            self.settings_tab.set_monitor_status("Фоновая проверка выключена.")
+
+    def monitor_run_now(self):
+        if self.monitor.running:
+            self.monitor.run_now()
+        else:
+            messagebox.showinfo("Фоновая проверка", "Включите фоновую проверку на вкладке «Настройки».")
+
+    def _monitor_notify(self, title: str, text: str, level: str):
+        if self.tray is not None:
+            self.tray.notify(title, text, level)
+
+    def _monitor_result(self, findings, level: str):
+        problems = sum(f.level in ("fail", "warn") for f in findings)
+        tip = "PIoT Helper: проблем нет" if not problems else f"PIoT Helper: проблем — {problems}"
+        when = datetime.now().strftime("%H:%M")
+        if self.tray is not None:
+            self.tray.set_state(level, tip)
+        self.ui(lambda: self.settings_tab.set_monitor_status(f"Последняя фоновая проверка в {when}: {tip.split(': ', 1)[1]}."))
+
+    def show_window(self):
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+    def on_close(self):
+        """Крестик: при включённой фоновой проверке окно прячется в значок, иначе программа закрывается."""
+        if self.tray is not None and self.cfg.get("monitor_enabled"):
+            self.withdraw()
+            if not self._hint_shown:
+                self._hint_shown = True
+                self.tray.notify("PIoT Helper", "Программа продолжает проверять кассу в фоне. Выход: правый клик по значку.", "ok")
+            return
+        self.shutdown()
+
+    def shutdown(self):
+        """Полный выход: остановить фоновую проверку и значок, закрыть окно."""
+        self.monitor.stop()
+        if self.tray is not None:
+            self.tray.stop()
+            self.tray = None
+        self.destroy()
 
     def bg(self, fn, done):
         """Выполнить fn в потоке, результат (или исключение) передать в done в потоке UI."""
@@ -76,6 +149,7 @@ class SummaryTab(ttk.Frame):
         ttk.Button(bar, text="Собрать отчёт для поддержки (.zip)", command=self.make_report).pack(side="left", padx=8)
         self.mask = tk.BooleanVar(value=app.cfg.get("mask_report", True))
         ttk.Checkbutton(bar, text="Маскировать личные данные", variable=self.mask).pack(side="left")
+        ttk.Button(bar, text="Сравнить два отчёта…", command=self.compare_reports).pack(side="left", padx=8)
         self.status = ttk.Label(bar, text="")
         self.status.pack(side="left", padx=8)
         self.text = tk.Text(self, wrap="word", font=("Consolas", 10), state="disabled")
@@ -101,6 +175,27 @@ class SummaryTab(ttk.Frame):
             warn = sum(1 for lvl, _ in rows if lvl == checks.WARN)
             self.status.config(text=f"Проблем: {bad}, предупреждений: {warn}")
         self.text.config(state="disabled")
+
+    def compare_reports(self):
+        """Выбрать два архива отчётов (старый и новый) и показать, что изменилось между ними."""
+        types = [("Отчёт PIoT Helper", "*.zip")]
+        old = filedialog.askopenfilename(title="Старый отчёт (раньше по времени)", filetypes=types)
+        if not old:
+            return
+        new = filedialog.askopenfilename(title="Новый отчёт (позже по времени)", filetypes=types)
+        if not new:
+            return
+        try:
+            diff = history.compare(history.read_report(old), history.read_report(new))
+        except (OSError, ValueError, KeyError) as e:
+            messagebox.showerror("Сравнение отчётов", f"Не удалось прочитать отчёт:\n{e}")
+            return
+        text = history.format_diff(diff, f"отчётом «{Path(old).name}»", f"отчётом «{Path(new).name}»")
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", text + "\n")
+        self.text.config(state="disabled")
+        self.status.config(text="Сравнение отчётов")
 
     def make_report(self):
         out = filedialog.asksaveasfilename(
@@ -554,8 +649,19 @@ class FixTab(ttk.Frame):
         warn = sum(f.level == checks.WARN for f in findings)
         fixable = sum(f.fix is not None for f in findings)
         self.status.config(text=f"Проблем: {bad}, предупреждений: {warn}, можно исправить: {fixable}")
-        self._set_detail(self.note or "Выберите строку, чтобы увидеть подробности. "
-                                      "Исправления выполняются только после подтверждения.")
+        # что изменилось с прошлой диагностики; текущий результат сохраняется как новая точка отсчёта
+        prev_time, prev = history.latest_snapshot()
+        diff_text = ""
+        if prev_time:
+            diff = history.compare(prev, [(f.level, f.title) for f in findings])
+            diff_text = f"С прошлой диагностики ({prev_time:%d.%m %H:%M}). " + history.format_diff(diff)
+        try:
+            history.save_snapshot(findings)
+        except OSError:
+            pass
+        head = self.note or ("Выберите строку, чтобы увидеть подробности. "
+                             "Исправления выполняются только после подтверждения.")
+        self._set_detail(head + (f"\n\n{diff_text}" if diff_text else ""))
         self.note = ""
 
     def on_select(self):
@@ -880,5 +986,9 @@ class PortOwnerTab(ttk.Frame):
         self.tcp_info.config(text=f"Соединений: {len(rows)}" if rows else "Никто не слушает и не подключён к этому порту")
 
 
-def run():
-    App().mainloop()
+def run(start_hidden: bool = False):
+    """start_hidden: запуск из автозапуска (--tray). Окно прячется, только если включена фоновая проверка."""
+    app = App()
+    if start_hidden and app.tray is not None and app.cfg.get("monitor_enabled"):
+        app.withdraw()
+    app.mainloop()

@@ -1,6 +1,10 @@
 # Локальные настройки и журналы с реальной кассы: в репозиторий не попадают
 config.json
 fixes.log
+rules_update.json
+rules_user.json
+history/
+monitor.log
 *.zip
 *.bak-*
 

@@ -2,13 +2,40 @@
 
 Источники: документация АТОЛ (atoldriver.ru), справка Контура и ЕСП, FAQ ТС ПИоТ, материалы ЦРПТ.
 Номера кодов в разных системах пересекаются (403, 407, 514), поэтому совпадение в логе — подсказка, а не приговор.
+
+Правила хранятся в данных, а не в коде. Слои (каждый следующий перекрывает предыдущий по ключу `key`):
+  1. piothelper/rules.json          — встроенные правила (лежат в репозитории и в exe);
+  2. <папка программы>/rules_update.json — правила, скачанные кнопкой «Обновить правила» (если версия новее встроенных);
+  3. <папка программы>/rules_user.json   — ваши правила: добавить своё, заменить встроенное с тем же key
+                                           или отключить: {"key": "514", "disabled": true}.
+
+Формат файла: {"rules_version": 1, "rules": [{"key", "pattern", "level": "fail|warn|info", "title", "advice",
+"transient": false}]}. Вместо `pattern` (или вместе с ним) можно задать `codes`: [{"n": "514", "extra": "нет ответа"}] —
+трёхзначный код засчитывается только рядом со словами «код/error/ошибка…» или со словами из `extra` после числа
+(иначе совпадают миллисекунды во времени 14:14:28.514).
 """
+import json
+import os
+import re
+import sys
+import urllib.parse
+import urllib.request
 from collections import namedtuple
+from pathlib import Path
+
+from .config import app_dir
 
 # transient=True: сбой разовый (связь, перезапуск); если он давно не повторяется, считаем его устранённым.
 Rule = namedtuple("Rule", "key pattern level title advice transient", defaults=(False,))
-TRANSIENT_KEYS = {"12029", "408", "514", "500", "421", "http", "oism", "dkkt_client", "serial", "lm_missing", "lm_unavail",
-                  "no_dkkt", "local_module", "lm4045"}
+
+RULES: list[Rule] = []
+TRANSIENT_KEYS: set[str] = set()
+RULES_INFO: dict = {"version": 0, "bundled": 0, "update": 0, "user": 0, "errors": []}
+
+DEFAULT_RULES_URL = "https://raw.githubusercontent.com/sooisdead/piot-helper/main/piothelper/rules.json"
+ALLOWED_HOSTS = {"raw.githubusercontent.com", "github.com"}
+MAX_RULES_BYTES = 512 * 1024
+MAX_RULES = 400
 
 # Внешние адреса, нужные ЕСМ (документация АТОЛ «Установка ЕСМ»): регистрация, проверка кодов, лицензия.
 EXTERNAL_HOSTS = {
@@ -18,16 +45,6 @@ EXTERNAL_HOSTS = {
 }
 MIN_ESM_VERSION = (1, 6, 4, 0)
 SHIFT_WARN_HOURS = 2  # предупреждать, если до конца 24-часовой смены осталось меньше
-
-
-def _code(n, extra=""):
-    """Трёхзначный код считается кодом ошибки только рядом со словами «код/error/ошибка…» (или с extra после числа).
-    Иначе совпадают миллисекунды в метках времени (14:14:28.514) и числа в дампах."""
-    ctx = r"(?:код|code|error|errorcode|ошибк\w*|status|http|rpc)"
-    p = rf"{ctx}\W{{0,8}}(?:{n})(?!\d|[.:]\d)"
-    if extra:
-        p += rf"|(?<![\d.:/-])(?:{n})(?!\d|[.:]\d)\W{{0,3}}(?:{extra})"
-    return p
 
 # Типовые порты связки Frontol 6 + Mark Unit + ЕСМ + драйвер АТОЛ (документация АТОЛ «ЕСМ и Frontol»).
 TYPICAL_PORTS = [
@@ -42,105 +59,169 @@ MIN_VERSIONS = {"frontol": (6, 28, 0), "driver": (10, 10, 8, 24)}
 CDN_TIMEOUT_RECOMMENDED = 2500  # мс; по умолчанию 1500
 CERT_FILES = ("ca.crt", "server.crt")
 
-RULES = [
-    Rule("lm_missing", r"не смог найти лм чз|лм чз не найден|error 20(25|59)|лм контроллер не найден", "warn",
-         "ЕСМ не видит ЛМ ЧЗ (локальный модуль Честного знака)",
-         "ЛМ ЧЗ не установлен, не запущен или недоступен на порту 5995. Онлайн-проверки (через ГИС МТ) работают, "
-         "офлайн-проверка — нет. Сразу после установки ЛМ ЧЗ это нормально первые минуты. Частые причины: в настройках "
-         "ЕСМ вместо порта контроллера 50063 указан порт самого ЛМ 5995 (его в ЕСМ вписывать не нужно); ЛМ ЧЗ 2.0 поставлен "
-         "раньше, чем ЕСМ и контроллер обновлены до 1.6 (обновлять в таком порядке: сначала ЕСМ и контроллер)."),
-    Rule("lm_notcfg", r"статус\s*=\s*not_configured|status\W{1,4}not_configured", "warn",
-         "ЛМ ЧЗ установлен, но не настроен (not_configured)",
-         "Офлайн-проверка недоступна. Пока ГИС МТ отвечает быстро (таймаут 1,5 с), продажи идут онлайн; при медленном ответе "
-         "возможна ошибка 514. Завершите настройку/инициализацию ЛМ ЧЗ по инструкции оператора ТС ПИоТ."),
-    Rule("lm_unavail", r"error 3007|сервер лм чз недоступен", "warn", "Сервер ЛМ ЧЗ недоступен (ошибка 3007)",
-         "Офлайн-проверка через ЛМ ЧЗ не выполнена: ЛМ ЧЗ не готов (см. not_configured) или перезапускается. "
-         "Если при этом онлайн-проверка прошла, продажа не блокируется."),
-    Rule("dkkt_client", r"client is not found|не удалось получить информацию из дккт", "warn",
-         "ЕСМ не нашёл клиента в gRPC-сервисе драйвера АТОЛ",
-         "Драйвер/служба «ATOL: Fptr grpc service» перезапускалась или ККТ не подключена. Подождите минуту; если не "
-         "проходит — перезапустите службу ESM: Control Module и проверьте, что в драйвере видна ККТ."),
-    Rule("lm_sync", r"статус\s*=\s*sync_error|status\W{1,4}sync_error", "fail",
-         "ЛМ ЧЗ: база устарела (sync_error — более 72 часов без связи с серверами ЦРПТ)",
-         "Офлайн-проверка ненадёжна. Обеспечьте стабильный доступ ЛМ ЧЗ в интернет (порт 443 к серверам ЦРПТ) и "
-         "дождитесь синхронизации; статус должен вернуться в ready."),
-    Rule("lm_failure", r"статус\s*=\s*failure|status\W{1,4}failure", "fail",
-         "ЛМ ЧЗ: внутренняя ошибка (failure), штатная работа невозможна",
-         "Перезапустите службу ЛМ ЧЗ; если не помогло — переустановите актуальную версию 2.x и заново выполните "
-         "инициализацию, при необходимости обратитесь в поддержку ЦРПТ."),
-    Rule("lm4045", _code(4045), "warn", "ЛМ ЧЗ 4045: вызван метод, требующий статуса ready, а модуль не готов",
-         "Часто после смены товарных групп (config/groups) или при неверно введённом токене. Дождитесь статуса ready, "
-         "проверьте стабильность интернета, при необходимости введите токен заново."),
-    Rule("lm5040", _code(5040), "fail", "ЛМ ЧЗ 5040: внутренняя ошибка модуля при инициализации",
-         "Проверьте, что установлена актуальная версия ветки 2.x; при необходимости переустановите ЛМ ЧЗ и выполните "
-         "инициализацию заново. Между ветками 1.5.x → 2.x автообновления нет."),
-    Rule("http_https", r"client sent an http request to an https server", "warn",
-         "Обращение по HTTP к HTTPS-порту ЕСМ",
-         "Кассовое ПО ходит на порт ЕСМ (51401) по http вместо https. Исправьте адрес в настройках кассового ПО."),
-    Rule("local_module", r"не удалось подключиться к локальному модулю", "warn",
-         "ЕСМ не подключился к локальному модулю (ЛМ ЧЗ)",
-         "Проверьте, что ЛМ ЧЗ и контроллер запущены, а в настройках ЕСМ указан порт контроллера 50063."),
-    Rule("no_dkkt", r"нет доступных ккт|не выбрано устройство", "warn", "ЕСМ не видит ККТ",
-         "Нужны: драйвер АТОЛ с компонентом «Интеграционные компоненты для ЕСМ», порт gRPC 4041, включённая касса и "
-         "открытая смена (меньше 24 ч); в окне ЕСМ нажмите «Обновить список»."),
-    Rule("crpt_forbidden", r"not authorized for this operation", "warn",
-         "ЦРПТ отклонил репликацию ЛМ ЧЗ (forbidden / not authorized)",
-         "ЛМ ЧЗ ещё не авторизован в системе ЦРПТ: не завершена его инициализация/настройка."),
-    Rule("lic", r"лицензия просрочена|license.{0,30}expired", "fail",
-         "Лицензия просрочена (лицензионная служба АТОЛ)",
-         "Продлите лицензию. Фраза «выдана последняя лицензия сроком до …» означает льготный период: после этой даты "
-         "Frontol/драйвер могут перестать работать, в том числе проверка кодов (ошибка 403)."),
-    Rule("serial", r"не найден заводской номер", "fail", "ТС ПИоТ АТОЛ: ККТ с таким заводским номером не найдена",
-         "Запрос пришёл на ККТ, которой нет среди подключённых к gRPC-сервису драйвера. Проверьте, что нужная касса "
-         "подключена, в драйвере выбрана верная ККТ и заводской номер в настройках совпадает с реальным."),
-    Rule("licerr", r"licenses updated, but same have an error", "warn", "Обновление лицензий прошло с ошибкой",
-         "Часть лицензий обновилась с ошибкой: см. строки про просроченные ключи в этом же логе."),
-    Rule("12029", r"(?<![\d.])12029(?![\d.])", "fail", "12029: касса не установила соединение с модулем",
-         "Модуль не запущен или не успел загрузиться, закрыт драйвер ККТ, порт блокируют антивирус/брандмауэр "
-         "или прокси. Проверьте вкладку «Исправления»: службы и порты."),
-    Rule("403", r"отсутствует активная лицензия|licen[sc]e.{0,40}(?<![\d.:/-])403(?!\d|[.:]\d)|(?<![\d.:/-])403(?!\d|[.:]\d).{0,40}(licen|лиценз)", "fail",
-         "403: нет активной лицензии (или модуль не получает данные от кассы)",
-         "Проверьте лицензию и регистрацию в ЛК ЕСП. Если лицензия активна: драйвер ККТ должен работать всю смену, "
-         "перезапустите службы модуля и драйвера."),
-    Rule("401", r"(?<![\d.:/-])401(?!\d|[.:]\d).{0,40}(auth|token|токен|аутент)|unauthorized", "fail",
-         "401: нет аутентификации (устаревший токен устройства)",
-         "Перерегистрируйте устройство в ЛК ЕСП, проверьте дату и время на компьютере."),
-    Rule("408", _code(408, "timeout|таймаут") + r"|нет проверки км|request timeout", "warn",
-         "408 / «Нет проверки КМ»: таймаут или идёт первичная синхронизация ЛМ ЧЗ",
-         "После первой установки ЛМ ЧЗ качает базу до 30 минут. Дождитесь, не перезапускайте службы. "
-         "Если не новая установка — проверьте интернет."),
-    Rule("514", _code(514, "нет ответа|не удалось получить ответ|гис мт"), "fail", "514: нет ответа от ГИС МТ или ЛМ ЧЗ",
-         "Проверьте интернет, статус ЛМ ЧЗ («ready»), порт 50063, сертификаты ca.crt/server.crt и "
-         "cdnCodesCheckTimeout (рекомендуется 2500 мс)."),
-    Rule("500", r"internal server error|внутренняя ошибка сервера|\b500\b.{0,30}(error|ошибк)", "warn",
-         "500: внутренняя ошибка сервиса",
-         "Повторите сканирование. При повторе перезапустите службы модуля и проверьте драйвер. Если ошибка появляется "
-         "сразу после сканирования кода, а лицензия оформлена как пробная — пробные 7 дней могли закончиться."),
-    Rule("407", _code(407, "блокировк") + r"|блокировк\w+ процедур\w+ аутентификации|работа с маркированными товарами временно", "warn",
-         "407: блокировка (часто параллельные проверки) или временная блокировка маркировки в ФН",
-         "Не запускайте проверки параллельно; повторяйте только неудавшуюся. Для блокировки в ФН см. 0x3464."),
-    Rule("0x3464", r"0x3464", "fail", "0x3464: работа с маркировкой временно заблокирована в ФН",
-         "В ФН накопились неотправленные уведомления. Восстановите связь с ОФД/ИСМ, дайте уведомлениям уйти. "
-         "Проверка в драйвере: «Маркировка» → «Состояние проверки КМ в ФН»."),
-    Rule("421", _code(421, "таймаут|истёк") + r"|таймаут проверки км", "warn", "421: истёк таймаут проверки КМ",
-         "Проверьте интернет и доступность сервера ИСМ, заполнен ли адрес ИСМ."),
-    Rule("0x4468", r"0x4468|признак\s+тмт", "fail", "0x4468: при регистрации ККТ не установлен признак «Торговля маркированными товарами»",
-         "Перерегистрируйте ККТ с признаком ТМТ и ФФД 1.2 (делается вручную, с изменением данных в ФНС)."),
-    Rule("gs", r"без разделителя gs|(?<![\d.:/-])405(?!\d|[.:]\d).{0,30}gs", "warn", "Код без разделителя GS",
-         "Сканер теряет управляющий символ 0x1D: включите передачу непечатаемых символов в настройках сканера."),
-    Rule("keys", _code("418|419|425") + r"|обновлени\w+ ключ", "warn", "Требуется обновление ключей проверки КМ",
-         "Проверьте связь с сервером обновления ключей (ОКП) и повторите."),
-    Rule("http", r"http-запрос не отправлен", "fail", "HTTP-запрос не отправлен",
-         "Служба модуля не запущена, порт 51401 заблокирован или нет доверия к сертификатам ЕСМ."),
-    Rule("com", r"проверки средствами ккт.{0,40}соединение не установлено", "fail",
-         "Ошибка проверки средствами ККТ: соединение не установлено",
-         "Чаще всего COM-порт занят утилитой «Тест драйвера АТОЛ». Закройте её (вкладка «Порт ККМ»)."),
-    Rule("cert", r"(ssl|tls|certificate|сертификат).{0,60}(error|ошибк|invalid|unknown|не довер|verify|просроч|expired)",
-         "fail", "Ошибка сертификата", "Проверьте сертификаты ЕСМ в доверенных корневых и точное время на компьютере."),
-    Rule("oism", r"запрос о коде маркировк\w* не был отправлен", "warn",
-         "Запрос о коде маркировки не был отправлен в ОИСМ",
-         "Выясните, почему ОИСМ не отвечает. Опция ОФД «Без ожидания ответа ОИСМ» — только временный обход."),
-    Rule("used", r"выведен из оборота|вышел из оборота|уже (продан|выведен)", "info",
-         "Код уже выведен из оборота (проблема кода, не модуля)",
-         "Повторная продажа невозможна. Проверьте статус кода в «ЧестныйЗНАК.Бизнес», связь с поставщиком, возврат/чек коррекции."),
-]
+
+# ---------- загрузка и проверка правил ----------
+
+def _code(n: str, extra: str = "") -> str:
+    ctx = r"(?:код|code|error|errorcode|ошибк\w*|status|http|rpc)"
+    p = rf"{ctx}\W{{0,8}}(?:{n})(?!\d|[.:]\d)"
+    if extra:
+        p += rf"|(?<![\d.:/-])(?:{n})(?!\d|[.:]\d)\W{{0,3}}(?:{extra})"
+    return p
+
+
+_NESTED_QUANTIFIER = re.compile(r"\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)\s*[+*{]")  # (a+)+ — риск «взрыва» регулярки
+
+
+def _build_pattern(item: dict) -> str:
+    parts = []
+    for c in item.get("codes") or []:
+        parts.append(_code(str(c["n"]), str(c.get("extra", ""))))
+    if item.get("pattern"):
+        parts.append(str(item["pattern"]))
+    return "|".join(parts)
+
+
+def validate_rules_doc(doc: object, allow_disabled: bool = False) -> tuple[list[dict], list[str]]:
+    """Проверяет документ правил. Возвращает (разобранные элементы, ошибки). Элементы — dict с готовым pattern."""
+    errors: list[str] = []
+    if not isinstance(doc, dict) or not isinstance(doc.get("rules"), list):
+        return [], ["ожидался объект с массивом rules"]
+    if len(doc["rules"]) > MAX_RULES:
+        return [], [f"слишком много правил (>{MAX_RULES})"]
+    items, seen = [], set()
+    for i, raw in enumerate(doc["rules"]):
+        where = f"правило #{i + 1}"
+        if not isinstance(raw, dict):
+            errors.append(f"{where}: не объект")
+            continue
+        key = raw.get("key")
+        if not isinstance(key, str) or not re.fullmatch(r"[\w.-]{1,40}", key):
+            errors.append(f"{where}: некорректный key")
+            continue
+        where = f"правило «{key}»"
+        if key in seen:
+            errors.append(f"{where}: повторяющийся key")
+            continue
+        seen.add(key)
+        if raw.get("disabled") is True:
+            if allow_disabled:
+                items.append({"key": key, "disabled": True})
+            else:
+                errors.append(f"{where}: disabled допустим только в rules_user.json")
+            continue
+        if raw.get("level") not in ("fail", "warn", "info"):
+            errors.append(f"{where}: level должен быть fail, warn или info")
+            continue
+        title, advice = raw.get("title"), raw.get("advice", "")
+        if not isinstance(title, str) or not title.strip() or len(title) > 200 or not isinstance(advice, str) or len(advice) > 1500:
+            errors.append(f"{where}: некорректные title/advice")
+            continue
+        try:
+            pattern = _build_pattern(raw)
+        except (KeyError, TypeError, ValueError) as e:
+            errors.append(f"{where}: некорректные codes ({e})")
+            continue
+        if not pattern or len(pattern) > 1500:
+            errors.append(f"{where}: пустой или слишком длинный pattern")
+            continue
+        if _NESTED_QUANTIFIER.search(pattern):
+            errors.append(f"{where}: вложенные квантификаторы в pattern (риск зависания)")
+            continue
+        try:
+            re.compile(pattern, re.I)
+        except re.error as e:
+            errors.append(f"{where}: ошибка в регулярном выражении ({e})")
+            continue
+        items.append({"key": key, "pattern": pattern, "level": raw["level"], "title": title.strip(),
+                      "advice": advice.strip(), "transient": bool(raw.get("transient", False))})
+    return items, errors
+
+
+def _bundled_path() -> Path:
+    here = Path(__file__).with_name("rules.json")
+    if here.exists():
+        return here
+    frozen = getattr(sys, "_MEIPASS", None)  # собранный exe: данные лежат во временной папке распаковки
+    return Path(frozen) / "piothelper" / "rules.json" if frozen else here
+
+
+def _read(path: Path, allow_disabled: bool = False) -> tuple[list[dict], int, list[str]]:
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8-sig"))  # sig: ваш rules_user.json может быть с BOM
+    except (OSError, ValueError) as e:
+        return [], 0, [f"{path.name}: {e}"]
+    items, errors = validate_rules_doc(doc, allow_disabled)
+    version = doc.get("rules_version", 0) if isinstance(doc, dict) else 0
+    return items, version if isinstance(version, int) else 0, [f"{path.name}: {e}" for e in errors]
+
+
+def load_rules() -> tuple[list[Rule], dict]:
+    """Склеивает слои: встроенные → скачанные (если новее) → пользовательские."""
+    info = {"version": 0, "bundled": 0, "update": 0, "user": 0, "errors": []}
+    merged: dict[str, dict] = {}
+    base, base_v, errs = _read(_bundled_path())
+    info["errors"] += errs
+    info["bundled"] = info["version"] = base_v
+    for it in base:
+        merged[it["key"]] = it
+    upd, upd_v, errs = _read(app_dir() / "rules_update.json") if (app_dir() / "rules_update.json").exists() else ([], 0, [])
+    info["errors"] += errs
+    if upd and upd_v > base_v:
+        info["update"] = info["version"] = upd_v
+        merged = {it["key"]: it for it in upd}  # скачанный набор полный и заменяет встроенный
+    usr, _, errs = _read(app_dir() / "rules_user.json", allow_disabled=True) if (app_dir() / "rules_user.json").exists() else ([], 0, [])
+    info["errors"] += errs
+    for it in usr:
+        if it.get("disabled"):
+            merged.pop(it["key"], None)
+        else:
+            merged[it["key"]] = it
+    info["user"] = len(usr)
+    rules = [Rule(it["key"], it["pattern"], it["level"], it["title"], it["advice"], it["transient"]) for it in merged.values()]
+    return rules, info
+
+
+def reload_rules() -> None:
+    """Перечитывает правила и обновляет RULES/TRANSIENT_KEYS на месте (на них ссылаются другие модули)."""
+    rules, info = load_rules()
+    RULES[:] = rules
+    TRANSIENT_KEYS.clear()
+    TRANSIENT_KEYS.update(r.key for r in rules if r.transient)
+    RULES_INFO.clear()
+    RULES_INFO.update(info)
+
+
+def update_rules(url: str = DEFAULT_RULES_URL, timeout: float = 15.0) -> str:
+    """Скачивает файл правил по кнопке пользователя. Принимает только https и только с GitHub, проверяет содержимое."""
+    from . import __version__
+    if urllib.parse.urlparse(url).scheme != "https":
+        raise ValueError("адрес правил должен начинаться с https://")
+    req = urllib.request.Request(url, headers={"User-Agent": f"PIoTHelper/{__version__}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if urllib.parse.urlparse(resp.geturl()).hostname not in ALLOWED_HOSTS:
+            raise ValueError("файл правил должен загружаться с GitHub")
+        data = resp.read(MAX_RULES_BYTES + 1)
+    if len(data) > MAX_RULES_BYTES:
+        raise ValueError("файл правил слишком большой")
+    doc = json.loads(data.decode("utf-8"))
+    items, errors = validate_rules_doc(doc)
+    if errors:
+        raise ValueError("файл правил отклонён: " + "; ".join(errors[:3]))
+    version = doc.get("rules_version")
+    if not isinstance(version, int):
+        raise ValueError("в файле нет числовой rules_version")
+    current = max(RULES_INFO["bundled"], RULES_INFO["update"])
+    if version <= current:
+        return f"Правила актуальны (версия {current})."
+    before = {r.key for r in RULES}
+    target = app_dir() / "rules_update.json"
+    tmp = target.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    os.replace(tmp, target)
+    reload_rules()
+    added = len({r.key for r in RULES} - before)
+    return f"Правила обновлены: версия {current} → {version}, правил: {len(RULES)} (новых: {added})."
+
+
+reload_rules()

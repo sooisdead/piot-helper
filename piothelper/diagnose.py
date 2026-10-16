@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import checks, fixes, knowledge, logs
+from . import checks, fixes, knowledge, logs, stats
 from .checks import FAIL, INFO, OK, WARN
 
 
@@ -328,9 +328,11 @@ def check_shift(cfg: dict) -> list[Finding]:
             if state == "closed":
                 return [Finding(INFO, f"Смена закрыта (по логу драйвера {f.name})",
                                 "Откройте смену: проверка кодов и регистрация ЕСМ работают только при открытой смене.")]
-            if state == "expired" or not exp:
-                return [Finding(FAIL if state == "expired" else INFO, f"Смена №{number}: состояние «{state or '?'}»",
-                                "Смена истекла (больше 24 ч): закройте её и откройте новую.")]
+            if state == "expired":
+                return [Finding(FAIL, f"Смена №{number} истекла (состояние «expired»)",
+                                "Смена дольше 24 часов: закройте её и откройте новую.")]
+            if not exp:
+                return [Finding(INFO, f"Смена №{number}: состояние «{state or '?'}»", "Время окончания смены в логе не найдено.")]
             end = datetime.datetime.fromisoformat(exp.group(1).replace("Z", "+00:00"))
             now = datetime.datetime.now(end.tzinfo) if end.tzinfo else datetime.datetime.now()
             left = (end - now).total_seconds() / 3600
@@ -376,6 +378,41 @@ def check_esm_version(cfg: dict) -> list[Finding]:
         return [Finding(WARN, f"ЕСМ {_fmt(low)} старее рекомендуемой {_fmt(knowledge.MIN_ESM_VERSION)}", shown +
                         "\nОбновите ЕСМ и контроллер (сначала их, и только потом ЛМ ЧЗ).")]
     return [Finding(OK, f"ЕСМ {_fmt(low)} (рекомендуется {_fmt(knowledge.MIN_ESM_VERSION)}+)", shown)]
+
+
+# ---------- статистика проверок марок ----------
+
+def esm_timeout(cfg: dict) -> int:
+    """Таймаут проверки кода в ЕСМ (cdnCodesCheckTimeout, мс): из конфига ЕСМ, иначе значение по умолчанию."""
+    conf = _find_esm_config(cfg)
+    if conf:
+        try:
+            m = re.search(r"cdnCodesCheckTimeout\s*:\s*(\d+)", conf.read_text(encoding="utf-8-sig", errors="replace"))
+            if m:
+                return int(m.group(1))
+        except OSError:
+            pass
+    return stats.DEFAULT_TIMEOUT_MS
+
+
+def check_mark_stats(cfg: dict) -> list[Finding]:
+    """Доля успешных проверок и время ответа ГИС МТ относительно таймаута ЕСМ (cdnCodesCheckTimeout)."""
+    hours = cfg.get("stats_hours", 24)
+    timeout = esm_timeout(cfg)
+    s = stats.summarize(stats.collect(cfg, hours), timeout)
+    if not s.total:
+        return [Finding(INFO, f"Проверок марок за {hours} ч в логах не найдено",
+                        "Пока ни одной продажи маркированного товара, либо логи ЕСМ не добавлены на вкладке «Пути».")]
+    text = stats.describe(s)
+    if s.failed and s.failed / s.total >= 0.2:
+        return [Finding(FAIL, f"Много неудачных проверок марок за {hours} ч: {s.failed} из {s.total}", text)]
+    if s.failed:
+        return [Finding(WARN, f"Есть неудачные проверки марок за {hours} ч: {s.failed} из {s.total}", text)]
+    if s.p95 is not None and s.p95 > timeout * 2 / 3:
+        return [Finding(WARN, f"Ответы ГИС МТ медленные: 95-й процентиль {s.p95:.0f} мс при таймауте {timeout} мс", text +
+                        "\nБлизко к порогу — возможны ошибки 514. Проверьте канал связи; при необходимости увеличьте "
+                        "cdnCodesCheckTimeout до 2500 (кнопка на вкладке «Исправления»).")]
+    return [Finding(OK, f"Проверки марок за {hours} ч: {text}")]
 
 
 # ---------- прокси ----------
@@ -457,7 +494,8 @@ def check_logs(cfg: dict) -> list[Finding]:
 CHECKS = [
     ("Службы", check_services), ("Порты", check_ports), ("Время", check_time), ("Сертификаты", check_certs),
     ("Конфиг ЕСМ", check_esm_config), ("Версии", check_versions), ("Версия ЕСМ", check_esm_version),
-    ("Внешние адреса", check_external), ("Смена", check_shift), ("Прокси", check_proxy), ("Логи", check_logs),
+    ("Внешние адреса", check_external), ("Смена", check_shift), ("Прокси", check_proxy),
+    ("Статистика проверок", check_mark_stats), ("Логи", check_logs),
 ]
 ORDER = {FAIL: 0, WARN: 1, INFO: 2, OK: 3}
 
