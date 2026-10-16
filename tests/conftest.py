@@ -7,6 +7,12 @@ import pytest
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+# Переменные Tk (BooleanVar и др.) закрытого окна уничтожаются сборщиком мусора в том потоке, где он сработал, и обращаются
+# к Tcl из чужого потока: «main thread is not in main loop». В тестах такая финализация не нужна и мешает соседним тестам.
+import tkinter  # noqa: E402
+
+tkinter.Variable.__del__ = lambda self: None
+
 
 @pytest.fixture(autouse=True)
 def isolated_app(tmp_path, monkeypatch):

@@ -84,14 +84,19 @@ def test_background_loop_runs_and_stops(monkeypatch, cfg):
     monkeypatch.setattr(monitor, "FIRST_RUN_DELAY", 0)
     monkeypatch.setattr(monitor, "MIN_INTERVAL_MIN", 0)
     runs = []
-    monkeypatch.setattr(diagnose, "run", lambda c: runs.append(1) or [F("ok", "ok")])
+
+    def fake_run(c):
+        runs.append(1)
+        time.sleep(0.02)  # без паузы цикл крутится вхолостую и на медленном раннере не успевает остановиться
+        return [F("ok", "ok")]
+    monkeypatch.setattr(diagnose, "run", fake_run)
     m = monitor.Monitor(lambda: cfg, lambda *a: None)
     m.start()
-    deadline = time.time() + 5
+    deadline = time.time() + 10
     while len(runs) < 2 and time.time() < deadline:
         time.sleep(0.05)
     m.stop()
-    m._thread.join(5)
+    m._thread.join(15)
     assert len(runs) >= 2 and not m.running
 
 
@@ -106,15 +111,15 @@ def test_loop_survives_an_exception(monkeypatch, cfg):
         if len(calls) == 1:
             raise RuntimeError("временный сбой")
         return [F("ok", "ok")]
-    monkeypatch.setattr(diagnose, "run", flaky)
+    monkeypatch.setattr(diagnose, "run", lambda c: (time.sleep(0.02), flaky(c))[1])
     m = monitor.Monitor(lambda: cfg, lambda *a: None)
     m.start()
-    deadline = time.time() + 5
+    deadline = time.time() + 10
     while len(calls) < 2 and time.time() < deadline:
         time.sleep(0.05)
     m.stop()
-    m._thread.join(5)
-    assert len(calls) >= 2
+    m._thread.join(15)
+    assert len(calls) >= 2 and not m.running
 
 
 # ---------- автозапуск (временный раздел реестра, настоящий Run не трогаем) ----------
