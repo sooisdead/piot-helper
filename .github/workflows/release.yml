@@ -29,7 +29,9 @@ jobs:
           --distpath dist --workpath build --specpath build main.py
       - name: Self-test the exe
         run: |
-          dist\PIoTHelper.exe --selftest --out selftest.json
+          # exe без консоли: PowerShell не ждёт его завершения, поэтому Start-Process -Wait
+          Start-Process -FilePath dist\PIoTHelper.exe -ArgumentList "--selftest","--out","selftest.json" -Wait
+          if (-not (Test-Path selftest.json)) { throw "selftest produced no output" }
           Get-Content selftest.json
           $j = Get-Content selftest.json -Raw | ConvertFrom-Json
           if (-not $j.frozen -or $j.discover_known_keywords -ne "ТС ПИоТ") { throw "selftest failed" }
