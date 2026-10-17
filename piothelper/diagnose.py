@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import checks, fixes, knowledge, logs, stats
+from . import checks, config, fixes, knowledge, logs, stats
 from .checks import FAIL, INFO, OK, WARN
 
 
@@ -237,6 +237,11 @@ def check_versions(cfg: dict) -> list[Finding]:
             out.append(Finding(FAIL, f"{label} {_fmt(v)} старее минимальной {_fmt(minimum)}", f"{f}\nОбновите для работы с ТС ПИоТ."))
         elif v:
             out.append(Finding(OK, f"{label} {_fmt(v)} (минимум {_fmt(minimum)})", str(f)))
+        if label == "Frontol" and v and v < knowledge.FRONTOL_EXPIRY_PROTECTION:
+            out.append(Finding(WARN, f"Frontol {_fmt(v)}: нет защиты от продажи просроченного маркированного товара",
+                               f"По сведениям поставщика, Frontol не даёт пробить просроченный маркированный товар начиная с "
+                               f"версии {_fmt(knowledge.FRONTOL_EXPIRY_PROTECTION)}. Подробности — в документации АТОЛ или у "
+                               "поддержки; обновите Frontol, если продаёте маркированные товары со сроком годности."))
     if frontol and driver:
         try:
             a, b = pe_machine(frontol), pe_machine(driver)
@@ -415,6 +420,87 @@ def check_mark_stats(cfg: dict) -> list[Finding]:
     return [Finding(OK, f"Проверки марок за {hours} ч: {text}")]
 
 
+# ---------- срок годности и права кассиров ----------
+
+EXPIRE_RE = re.compile(r"expireDate\W{1,6}(\d{4})-(\d{2})-(\d{2})")
+
+
+def check_expired_goods(cfg: dict) -> list[Finding]:
+    """Сканировались ли коды с истёкшим сроком годности: ГИС МТ присылает expireDate в ответе на проверку кода (лог ЕСМ).
+    Сами коды в находки не попадают. Факт сканирования не доказывает, что товар продан: запрет мог сработать."""
+    hours = cfg.get("stats_hours", 24)
+    border = datetime.datetime.now() - datetime.timedelta(hours=hours)
+    today = datetime.date.today()
+    seen: set = set()
+    expired: list[tuple[datetime.datetime, datetime.date]] = []
+    checked = False
+    for entry in cfg["paths"]:
+        if entry["kind"] != "log":
+            continue
+        for f in logs.list_log_files(entry["path"].strip())[:3]:
+            try:
+                if datetime.datetime.fromtimestamp(f.stat().st_mtime) < border:
+                    continue
+                lines = logs.read_tail(f, cfg["tail_kb"])
+            except OSError:
+                continue
+            for ln in lines:
+                if "expireDate" not in ln or "cis" not in ln:
+                    continue
+                t = logs.line_time(ln)
+                if not t or t < border:
+                    continue
+                dates = []
+                for y, m, d in EXPIRE_RE.findall(ln):
+                    try:
+                        dates.append(datetime.date(int(y), int(m), int(d)))
+                    except ValueError:
+                        pass
+                if not dates:
+                    continue
+                key = (t.replace(microsecond=0), tuple(sorted(dates)))  # ответ пишется в лог дважды — считаем один раз
+                if key in seen:
+                    continue
+                seen.add(key)
+                checked = True
+                bad = [d for d in dates if d < today]
+                if bad:
+                    expired.append((t, min(bad)))
+    if expired:
+        last = max(t for t, _ in expired)
+        oldest = min(d for _, d in expired)
+        return [Finding(WARN, f"Сканировались коды с истёкшим сроком годности: {len(expired)} за {hours} ч (последний {last:%d.%m %H:%M})",
+                        f"ГИС МТ вернул срок годности в прошлом (самый давний {oldest:%d.%m.%Y}). Это не значит, что товар продан: "
+                        "запрет мог сработать. Но если кассир смог его пробить — риск штрафа. Проверьте права кассиров во Frontol "
+                        "(отдельная находка ниже) и версию Frontol (6.29.0+). Сами коды в отчёт не попадают.")]
+    if checked:
+        return [Finding(OK, f"Кодов с истёкшим сроком годности за {hours} ч не сканировалось")]
+    return [Finding(INFO, f"Срок годности проверенных кодов за {hours} ч не определён",
+                    "В логах ЕСМ нет ответов проверки кода с expireDate (нет продаж или логи ЕСМ не добавлены на вкладке «Пути»).")]
+
+
+def check_frontol_rights(cfg: dict) -> list[Finding]:
+    """Напоминание проверить права кассиров во Frontol. Базу Frontol программа не читает, поэтому только подсказка и отметка даты."""
+    days = cfg.get("rights_review_days", 90)
+    try:
+        when = datetime.date.fromisoformat(cfg.get("frontol_rights_confirmed", ""))
+    except ValueError:
+        when = None
+    if when and (datetime.date.today() - when).days <= days:
+        left = days - (datetime.date.today() - when).days
+        return [Finding(OK, f"Права кассиров во Frontol проверены {when:%d.%m.%Y} (напомню через {left} дн.)", knowledge.FRONTOL_RIGHTS_TEXT)]
+
+    def confirm() -> str:
+        cfg["frontol_rights_confirmed"] = datetime.date.today().isoformat()
+        config.save(cfg)
+        return f"Отмечено: права проверены {datetime.date.today():%d.%m.%Y}, напомню через {days} дн."
+
+    return [Finding(INFO, "Права кассиров во Frontol: проверьте вручную (чтобы не продавали товар в обход запрета)",
+                    knowledge.FRONTOL_RIGHTS_TEXT,
+                    Fix("Отметить: права проверены", f"Запомнить сегодняшнюю дату проверки прав и не напоминать {days} дней. "
+                                                    "В Frontol ничего не меняется.", confirm, needs_admin=False))]
+
+
 # ---------- прокси ----------
 
 def check_proxy(cfg: dict) -> list[Finding]:
@@ -495,7 +581,8 @@ CHECKS = [
     ("Службы", check_services), ("Порты", check_ports), ("Время", check_time), ("Сертификаты", check_certs),
     ("Конфиг ЕСМ", check_esm_config), ("Версии", check_versions), ("Версия ЕСМ", check_esm_version),
     ("Внешние адреса", check_external), ("Смена", check_shift), ("Прокси", check_proxy),
-    ("Статистика проверок", check_mark_stats), ("Логи", check_logs),
+    ("Статистика проверок", check_mark_stats), ("Срок годности", check_expired_goods),
+    ("Права Frontol", check_frontol_rights), ("Логи", check_logs),
 ]
 ORDER = {FAIL: 0, WARN: 1, INFO: 2, OK: 3}
 
