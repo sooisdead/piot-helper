@@ -8,8 +8,8 @@ from tkinter import filedialog, messagebox, ttk
 
 from datetime import datetime
 
-from . import (__version__, checks, config, diagnose, discover, fixes, history, knowledge, logs, monitor, portowner,
-               report, restart, tray)
+from . import (__version__, checks, config, diagnose, discover, errorlog, fixes, history, knowledge, logs, monitor,
+               portowner, report, restart, tray)
 from .gui_extra import SettingsTab, TimelineTab
 
 COLORS = {checks.OK: "#1a7f37", checks.WARN: "#9a6700", checks.FAIL: "#cf222e", checks.INFO: "#57606a"}
@@ -121,6 +121,7 @@ class App(tk.Tk):
             try:
                 self._q.put((done, fn(), None))
             except Exception as e:  # noqa: BLE001
+                errorlog.log(e, "фоновая задача")  # в окне ошибку покажет done, а в журнале останется полный след
                 self._q.put((done, None, e))
         threading.Thread(target=work, daemon=True).start()
 
@@ -132,10 +133,21 @@ class App(tk.Tk):
         try:
             while True:
                 done, res, err = self._q.get_nowait()
-                done(res, err)
+                try:
+                    done(res, err)
+                except Exception as e:  # noqa: BLE001 — один сбойный обработчик не должен останавливать опрос очереди
+                    errorlog.log(e, "обработчик результата")
         except queue.Empty:
             pass
         self.after(100, self._poll)
+
+    def report_callback_exception(self, exc, val, tb):
+        """Необработанная ошибка в обработчике окна: в журнал и одно понятное сообщение вместо молчания."""
+        short = errorlog.log(val, "обработчик окна") or str(val)
+        if not getattr(self, "_error_shown", False):
+            self._error_shown = True
+            messagebox.showerror("PIoT Helper", f"Произошла ошибка:\n{short}\n\nПодробности записаны в файл:\n{errorlog.path()}")
+            self.after(5000, lambda: setattr(self, "_error_shown", False))  # не заваливаем окнами при повторах
 
 
 class SummaryTab(ttk.Frame):

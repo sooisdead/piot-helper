@@ -5,6 +5,7 @@ rules_update.json
 rules_user.json
 history/
 monitor.log
+error.log
 *.zip
 *.bak-*
 

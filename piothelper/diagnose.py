@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import checks, config, fixes, knowledge, logs, stats
+from . import checks, config, errorlog, fixes, knowledge, logs, stats
 from .checks import FAIL, INFO, OK, WARN
 
 
@@ -593,5 +593,6 @@ def run(cfg: dict) -> list[Finding]:
         try:
             findings += fn(cfg)
         except Exception as e:  # noqa: BLE001 — одна упавшая проверка не должна ломать остальные
-            findings.append(Finding(WARN, f"Проверка «{name}» не выполнена", str(e)))
+            errorlog.log(e, f"проверка «{name}»")
+            findings.append(Finding(WARN, f"Проверка «{name}» не выполнена", f"{type(e).__name__}: {e}\nПодробности — в {errorlog.path().name}."))
     return sorted(findings, key=lambda f: ORDER[f.level])

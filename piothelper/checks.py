@@ -31,32 +31,53 @@ def list_services(patterns: list[str]) -> list[dict]:
     return [s for s in all_services() if keyword_match(f"{s['name']} {s['display']}", patterns)]
 
 
-def all_services() -> list[dict]:
-    """Все службы Windows одним вызовом: [{name, display, status, start}]."""
-    script = (
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8;"
-        "Get-Service | Select-Object Name,DisplayName,Status,StartType | ConvertTo-Json -Compress"
-    )
-    out = subprocess.run(
-        [POWERSHELL, "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True, timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-    )
+_STATUS = {1: "Stopped", 2: "StartPending", 3: "StopPending", 4: "Running", 5: "ContinuePending", 6: "PausePending", 7: "Paused"}
+_START_TYPE = {0: "Boot", 1: "System", 2: "Automatic", 3: "Manual", 4: "Disabled"}
+_CIM_STATE = {"Running": "Running", "Stopped": "Stopped", "Start Pending": "StartPending", "Stop Pending": "StopPending",
+              "Continue Pending": "ContinuePending", "Pause Pending": "PausePending", "Paused": "Paused"}
+_CIM_START = {"Auto": "Automatic", "Manual": "Manual", "Disabled": "Disabled", "Boot": "Boot", "System": "System"}
+
+
+def _run_json(script: str, timeout: int = 40) -> list[dict]:
     import json
-    data = json.loads(out.stdout.decode("utf-8", errors="replace") or "[]")
-    if isinstance(data, dict):
-        data = [data]
-    status_names = {1: "Stopped", 2: "StartPending", 3: "StopPending", 4: "Running", 5: "ContinuePending", 6: "PausePending", 7: "Paused"}
-    start_names = {0: "Boot", 1: "System", 2: "Automatic", 3: "Manual", 4: "Disabled"}
-    result = []
+    out = subprocess.run([POWERSHELL, "-NoProfile", "-NonInteractive", "-Command",
+                          "[Console]::OutputEncoding=[Text.Encoding]::UTF8;" + script],
+                         capture_output=True, timeout=timeout, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    data = json.loads(out.stdout.decode("utf-8", errors="replace").strip() or "[]")
+    return [data] if isinstance(data, dict) else data
+
+
+def parse_cim_services(data: list[dict]) -> list[dict]:
+    """Win32_Service → [{name, display, status, start}]. StartMode есть во всех версиях Windows, в отличие от StartType."""
+    return [{"name": s["Name"], "display": s.get("DisplayName") or s["Name"],
+             "status": _CIM_STATE.get(s.get("State"), str(s.get("State"))),
+             "start": _CIM_START.get(s.get("StartMode"), str(s.get("StartMode")))} for s in data]
+
+
+def parse_get_service(data: list[dict]) -> list[dict]:
+    """Запасной вариант (Get-Service): тип запуска в PowerShell 4 (Windows 8.1) и старше не определяется."""
+    out = []
     for s in data:
-        st, sm = s["Status"], s["StartType"]
-        result.append({
-            "name": s["Name"],
-            "display": s["DisplayName"],
-            "status": status_names.get(st, str(st)) if isinstance(st, int) else str(st),
-            "start": start_names.get(sm, str(sm)) if isinstance(sm, int) else str(sm),
-        })
-    return result
+        st, sm = s["Status"], s.get("StartType")
+        out.append({"name": s["Name"], "display": s["DisplayName"],
+                    "status": _STATUS.get(st, str(st)) if isinstance(st, int) else str(st),
+                    "start": (_START_TYPE.get(sm, str(sm)) if isinstance(sm, int) else str(sm)) if sm is not None else "Unknown"})
+    return out
+
+
+def all_services() -> list[dict]:
+    """Все службы Windows одним вызовом: [{name, display, status, start}].
+
+    Основной способ — WMI/CIM (Win32_Service): работает и в PowerShell 4 (Windows 8.1), где у Get-Service нет StartType.
+    Если WMI на кассе повреждён или пуст, используется Get-Service (тип запуска тогда неизвестен)."""
+    try:
+        services = parse_cim_services(_run_json("Get-CimInstance Win32_Service | Select-Object Name,DisplayName,State,StartMode "
+                                                "| ConvertTo-Json -Compress"))
+        if services:
+            return services
+    except Exception:  # noqa: BLE001 — переходим к запасному способу
+        pass
+    return parse_get_service(_run_json("Get-Service | Select-Object Name,DisplayName,Status,StartType | ConvertTo-Json -Compress"))
 
 
 def check_port(host: str, port: int, timeout: float = 2.0) -> tuple[bool, str]:

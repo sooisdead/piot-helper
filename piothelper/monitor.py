@@ -5,7 +5,7 @@ import threading
 from datetime import datetime, timedelta
 from typing import Callable
 
-from . import diagnose, history
+from . import diagnose, errorlog, history
 
 FIRST_RUN_DELAY = 20       # секунд после запуска, чтобы окно успело открыться
 MIN_INTERVAL_MIN = 5
@@ -111,6 +111,7 @@ class Monitor:
                 self.run_once()
             except Exception as e:  # noqa: BLE001 — поток не должен умирать из-за одной ошибки
                 self._log(f"ошибка проверки: {e}")
+                errorlog.log(e, "фоновая проверка")
             minutes = max(MIN_INTERVAL_MIN, int(self.get_cfg().get("monitor_minutes", 15)))
             self._wake.wait(minutes * 60)
 

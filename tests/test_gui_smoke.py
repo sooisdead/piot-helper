@@ -81,6 +81,33 @@ def test_timeline_tab_builds_from_log(app, tmp_path):
     assert len(tab.events) == 1 and len(tab.tree.get_children()) == 1
 
 
+def test_failing_result_handler_does_not_stop_the_queue(app, isolated_app):
+    done = []
+
+    def bad(res, err):
+        raise RuntimeError("обработчик упал")
+    app._q.put((bad, None, None))
+    app._q.put((lambda res, err: done.append("второй"), None, None))
+    _pump(app, until=lambda: done)
+    assert done == ["второй"]                                             # очередь пережила сбой
+    assert "обработчик упал" in (isolated_app / "error.log").read_text(encoding="utf-8")
+    later = []
+    app._q.put((lambda res, err: later.append(1), None, None))            # и опрос продолжает работать
+    _pump(app, until=lambda: later)
+    assert later == [1]
+
+
+def test_unhandled_window_error_is_logged_and_shown_once(app, isolated_app, monkeypatch):
+    from tkinter import messagebox
+    shown = []
+    monkeypatch.setattr(messagebox, "showerror", lambda title, msg, **k: shown.append(msg))
+    app._error_shown = False
+    app.report_callback_exception(RuntimeError, RuntimeError("упал обработчик кнопки"), None)
+    app.report_callback_exception(RuntimeError, RuntimeError("упал ещё раз"), None)
+    assert len(shown) == 1 and "упал обработчик кнопки" in shown[0] and "error.log" in shown[0]
+    assert "упал ещё раз" in (isolated_app / "error.log").read_text(encoding="utf-8")   # в журнал попадают обе
+
+
 def test_settings_show_rules_info_and_reload(app):
     tab = app.settings_tab
     assert f"Версия правил: {knowledge.RULES_INFO['version']}" in tab.rules_label.cget("text")

@@ -5,7 +5,7 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, checks, diagnose, logs, timeline
+from . import __version__, checks, diagnose, errorlog, fixes, logs, timeline
 from .mask import Masker
 
 MARK = {checks.OK: "[ OK ]", checks.WARN: "[WARN]", checks.FAIL: "[FAIL]", checks.INFO: "[INFO]"}
@@ -27,9 +27,14 @@ def build_report(cfg: dict, out_path: Path, mask: bool | None = None) -> str:
 
     summary = checks.run_summary(cfg)
     findings = diagnose.run(cfg)
+    try:  # версия PowerShell: на Windows 8.1 это 4.0, и часть возможностей работает иначе
+        ps_version = fixes.ps("$PSVersionTable.PSVersion.ToString()", timeout=20)
+    except Exception:  # noqa: BLE001
+        ps_version = "не определена"
     header = (
         f"Отчёт PIoT Helper {__version__}, {datetime.now():%d.%m.%Y %H:%M:%S}\n"
         f"Компьютер: {platform.node()}, {platform.platform()}\n"
+        f"Окружение: {errorlog.environment()}; PowerShell {ps_version}\n"
         f"{MASKED_NOTE if mask else PLAIN_NOTE}\n"
     )
     summary_text = header + "\n".join(f"{MARK[lvl]} {line}" for lvl, line in summary) + "\n"
@@ -50,6 +55,11 @@ def build_report(cfg: dict, out_path: Path, mask: bool | None = None) -> str:
         ("timeline.txt", timeline_text),
         ("config.json", json.dumps(cfg, ensure_ascii=False, indent=2)),
     ]
+    if errorlog.path().exists():  # собственные ошибки программы — первое, что нужно для разбора
+        try:
+            entries.append(("error.log", errorlog.path().read_text(encoding="utf-8", errors="replace")[-100_000:]))
+        except OSError:
+            pass
     for entry in cfg["paths"]:
         if entry["kind"] != "log":
             continue

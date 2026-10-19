@@ -243,7 +243,12 @@ class SettingsTab(ttk.Frame):
             self.update_btn.config(state="normal")
             self.refresh_rules()
             if err:
-                messagebox.showerror("Обновление правил", f"Не удалось обновить правила:\n{err}")
+                hint = ""
+                if "CERTIFICATE_VERIFY_FAILED" in str(err):
+                    hint = ("\n\nНа этом компьютере нет актуальных корневых сертификатов (так бывает на Windows 8.1 и старее "
+                            "без обновлений). Установите обновления Windows либо скачайте rules.json вручную и положите "
+                            "рядом с программой как rules_update.json.")
+                messagebox.showerror("Обновление правил", f"Не удалось обновить правила:\n{err}{hint}")
             else:
                 messagebox.showinfo("Обновление правил", msg)
         self.app.bg(lambda: knowledge.update_rules(url), done)
