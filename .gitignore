@@ -6,6 +6,8 @@ rules_user.json
 history/
 monitor.log
 error.log
+scheduled_restart.log
+scheduled_restart.json
 *.zip
 *.bak-*
 

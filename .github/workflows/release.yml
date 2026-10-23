@@ -36,6 +36,13 @@ jobs:
           $j = Get-Content selftest.json -Raw | ConvertFrom-Json
           if (-not $j.frozen -or $j.discover_known_keywords -ne "ТС ПИоТ") { throw "selftest failed" }
           if ($j.rules -lt 30) { throw "rules.json is missing from the build (rules=$($j.rules))" }
+      - name: Self-test the scheduled-restart mode
+        run: |
+          # на раннере нет служб ЕСМ, поэтому ожидаем код 2 («службы не найдены»); главное — не зависает и не открывает окно
+          $p = Start-Process -FilePath dist\PIoTHelper.exe -ArgumentList "--scheduled-restart","--dry-run" -PassThru
+          if (-not $p.WaitForExit(120000)) { $p.Kill(); throw "scheduled-restart mode hung" }
+          if ($p.ExitCode -ne 2) { throw "unexpected exit code $($p.ExitCode)" }
+          Get-Content dist\scheduled_restart.log
       - name: SHA-256
         id: hash
         run: |

@@ -54,6 +54,11 @@ DEFAULT_CONFIG = {
     # Связка служб для «Перезапустить связку» — в порядке ЗАПУСКА (останавливаются в обратном порядке).
     # Каждое слово ищется в имени или описании службы (подстрокой).
     "restart_chain": ["Fptr grpc", "ESM: Control Module", "ESM: Local Module Controller", "ESM: Orchestrator"],
+    # Ночной перезапуск служб ЕСМ (задача Планировщика Windows). Драйвер АТОЛ намеренно не входит: с ним связан Frontol.
+    "scheduled_restart_time": "05:00",
+    "scheduled_restart_chain": ["ESM: Control Module", "ESM: Local Module Controller", "ESM: Orchestrator"],
+    "scheduled_restart_quiet_minutes": 10,   # перезапускать, только если столько минут не было проверок марок
+    "scheduled_restart_wait_minutes": 60,    # сколько ждать тишины; не дождались — пропустить эту ночь
     # Типовые места установки ТС ПИоТ (ЕСМ): проверяются автопоиском напрямую.
     "known_paths": [r"C:\ProgramData\ESP", r"C:\ProgramData\ESP\ESM", r"C:\Program Files\ESP",
                     r"C:\Program Files (x86)\ESP", r"C:\ProgramData\ESP\ESM\um"],

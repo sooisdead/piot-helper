@@ -501,6 +501,31 @@ def check_frontol_rights(cfg: dict) -> list[Finding]:
                                                     "В Frontol ничего не меняется.", confirm, needs_admin=False))]
 
 
+# ---------- ночной перезапуск ----------
+
+def check_nightly_restart(cfg: dict) -> list[Finding]:
+    """Если ночной перезапуск включён — следим, что задача жива: не указывает на старый путь и не падает при запуске."""
+    from . import schedule, scheduled
+    info = schedule.status()
+    if info is None:
+        return []
+    when = info.get("time") or "?"
+    if info.get("program") and not schedule.points_to_this_program(info):
+        return [Finding(WARN, "Ночной перезапуск настроен на другой файл программы",
+                        f"Задача запускает {info['program']}, а программа сейчас {schedule.command()[0]}. Если программу перенесли, "
+                        "выключите и снова включите ночной перезапуск на вкладке «Настройки», иначе он не сработает.")]
+    last = info.get("last_result")
+    if info.get("last_run") and last not in (None, 0, schedule.NEVER_RAN):
+        return [Finding(WARN, f"Ночной перезапуск в {when}: последний запуск завершился с кодом {last:#x}",
+                        "Смотрите scheduled_restart.log рядом с программой. Коды результата программы: 1 — ошибка перезапуска, "
+                        "2 — службы не найдены, 3 — пропущено из-за продаж; остальные коды выдаёт сам Планировщик Windows.")]
+    state = scheduled.load_state()
+    if state and not state.get("ok") and not state.get("skipped"):
+        return [Finding(WARN, f"Ночной перезапуск в {when}: последний раз не удался", f"{state['message']} ({state['time']})")]
+    tail = f"; последний итог: {state['message']}" if state else ""
+    return [Finding(OK, f"Ночной перезапуск служб ЕСМ включён: каждый день в {when}{tail}")]
+
+
 # ---------- прокси ----------
 
 def check_proxy(cfg: dict) -> list[Finding]:
@@ -582,7 +607,7 @@ CHECKS = [
     ("Конфиг ЕСМ", check_esm_config), ("Версии", check_versions), ("Версия ЕСМ", check_esm_version),
     ("Внешние адреса", check_external), ("Смена", check_shift), ("Прокси", check_proxy),
     ("Статистика проверок", check_mark_stats), ("Срок годности", check_expired_goods),
-    ("Права Frontol", check_frontol_rights), ("Логи", check_logs),
+    ("Права Frontol", check_frontol_rights), ("Ночной перезапуск", check_nightly_restart), ("Логи", check_logs),
 ]
 ORDER = {FAIL: 0, WARN: 1, INFO: 2, OK: 3}
 

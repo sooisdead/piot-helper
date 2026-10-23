@@ -18,11 +18,15 @@ VERIFY_SECONDS = 90
 QUIET_SECONDS = 30  # столько без свежих ошибок считаем «связь восстановлена»
 
 
-def resolve_chain(cfg: dict) -> tuple[list[dict], list[str]]:
-    """Службы по шаблонам restart_chain в порядке запуска. Возвращает (найденные, шаблоны без совпадений)."""
+RESTORED_TEXT = "Связь восстановлена"  # так начинается успешный итог run_chain
+
+
+def resolve_chain(cfg: dict, key: str = "restart_chain") -> tuple[list[dict], list[str]]:
+    """Службы по шаблонам из cfg[key] (restart_chain — вручную, scheduled_restart_chain — ночной перезапуск) в порядке
+    запуска. Возвращает (найденные, шаблоны без совпадений)."""
     services = checks.all_services()
     chain, missing, seen = [], [], set()
-    for pattern in cfg["restart_chain"]:
+    for pattern in cfg[key]:
         hits = [s for s in services if keyword_match(f"{s['name']} {s['display']}", [pattern]) and s["name"] not in seen]
         if not hits:
             missing.append(pattern)
@@ -108,5 +112,5 @@ def run_chain(chain: list[dict], cfg: dict, say: Callable[[str], None]) -> str:
         verdict = ("Службы запущены, но ЕСМ пока сообщает о проблемах связи (последние записи ниже). "
                    "Подождите 1–2 минуты и запустите диагностику ещё раз.\n  " + "\n  ".join(problems[-3:]))
     else:
-        verdict = "Связь восстановлена: свежих ошибок связи ЕСМ с драйвером/модулем в логах нет."
+        verdict = f"{RESTORED_TEXT}: свежих ошибок связи ЕСМ с драйвером/модулем в логах нет."
     return "\n".join(report) + f"\n\n{verdict}\nВремя: {spent:.0f} с."

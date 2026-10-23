@@ -4,7 +4,7 @@ import tkinter as tk
 import webbrowser
 from tkinter import filedialog, messagebox, ttk
 
-from . import __version__, autostart, checks, diagnose, knowledge, stats, timeline
+from . import __version__, autostart, checks, diagnose, knowledge, portowner, schedule, scheduled, stats, timeline
 from .config import app_dir
 
 REPO_URL = "https://github.com/sooisdead/piot-helper"
@@ -164,6 +164,25 @@ class SettingsTab(ttk.Frame):
         self.monitor_status.grid(row=4, column=0, columnspan=3, sticky="w", padx=28, pady=(2, 8))
         ttk.Button(bg, text="Проверить сейчас", command=app.monitor_run_now).grid(row=1, column=3, padx=12)
 
+        night = ttk.LabelFrame(self, text="Ночной перезапуск служб ПИоТ")
+        night.pack(fill="x", padx=10, pady=6)
+        self.night_on = tk.BooleanVar(value=False)
+        ttk.Checkbutton(night, text="Перезапускать службы ЕСМ каждый день в", variable=self.night_on,
+                        command=self.on_nightly_toggle).grid(row=0, column=0, sticky="w", padx=8, pady=(6, 2))
+        self.night_time = tk.StringVar(value=cfg.get("scheduled_restart_time", "05:00"))
+        ttk.Entry(night, textvariable=self.night_time, width=7).grid(row=0, column=1, sticky="w")
+        ttk.Button(night, text="Сменить время", command=self.on_nightly_time).grid(row=0, column=2, padx=6)
+        ttk.Button(night, text="Проверить без перезапуска", command=self.test_nightly).grid(row=0, column=3)
+        self.night_status = ttk.Label(night, text="Проверяю планировщик…", wraplength=900, justify="left")
+        self.night_status.grid(row=1, column=0, columnspan=4, sticky="w", padx=8, pady=(2, 2))
+        ttk.Label(night, wraplength=900, justify="left", text=(
+            "Перезапускаются только службы ЕСМ (драйвер АТОЛ не затрагивается). Перед перезапуском программа ждёт паузы в "
+            "продажах (до часа); если продажи не прекратились, эту ночь пропускает. Задачу выполняет Планировщик Windows от имени "
+            "SYSTEM, окно программы для этого открыто быть не должно. Нужны права администратора. Это обходной приём, а не "
+            "исправление: причины ошибок (лицензия, сеть, ЛМ ЧЗ) он не устраняет.")).grid(
+            row=2, column=0, columnspan=4, sticky="w", padx=8, pady=(0, 8))
+        app.after(600, self.refresh_nightly)
+
         rules = ttk.LabelFrame(self, text="Правила разбора логов")
         rules.pack(fill="x", padx=10, pady=6)
         self.rules_label = ttk.Label(rules, text="", wraplength=900, justify="left")
@@ -217,6 +236,106 @@ class SettingsTab(ttk.Frame):
 
     def set_monitor_status(self, text: str):
         self.monitor_status.config(text=text)
+
+    # ----- ночной перезапуск -----
+
+    def refresh_nightly(self):
+        self.app.bg(schedule.status, self._nightly_shown)
+
+    def _nightly_shown(self, info, err):
+        if err:
+            self.night_status.config(text=f"Не удалось прочитать Планировщик Windows: {err}")
+            return
+        self.night_on.set(info is not None)
+        if info is None:
+            self.night_status.config(text="Выключен.")
+            return
+        if info["time"]:
+            self.night_time.set(info["time"])
+        text = f"Включён: каждый день в {info['time'] or self.night_time.get()}."
+        if info["next_run"]:
+            text += f" Следующий запуск: {info['next_run'].replace('T', ' ')[:16]}."
+        if info["last_run"]:
+            ok = info["last_result"] in (0, None)
+            text += f" Последний запуск: {info['last_run'].replace('T', ' ')[:16]}" + ("." if ok else f", код {info['last_result']:#x}.")
+        state = scheduled.load_state()
+        if state:
+            text += f" Итог: {state['message']}" + (" (пропущено)" if state.get("skipped") else "") + f" [{state['time'].replace('T', ' ')[:16]}]."
+        if info["program"] and not schedule.points_to_this_program(info):
+            text += (f"\nВНИМАНИЕ: задача запускает другой файл ({info['program']}). Если программу перенесли, выключите и снова "
+                     "включите ночной перезапуск, иначе он не сработает.")
+        self.night_status.config(text=text)
+
+    def _need_admin(self) -> bool:
+        if portowner.is_admin():
+            return False
+        if messagebox.askyesno("Нужны права администратора",
+                               "Создание и удаление задачи Планировщика требует прав администратора.\n"
+                               "Перезапустить программу от администратора?"):
+            portowner.relaunch_as_admin()
+            self.app.destroy()
+        return True
+
+    def _apply_nightly(self, install: bool):
+        time_text = self.night_time.get().strip()
+
+        def work():
+            return schedule.install(time_text) if install else schedule.remove()
+
+        def done(msg, err):
+            if err:
+                messagebox.showerror("Ночной перезапуск", f"Не удалось изменить задачу:\n{err}")
+            elif install:
+                self.app.cfg["scheduled_restart_time"] = time_text
+                self.app.save()
+            self.refresh_nightly()
+        self.app.bg(work, done)
+
+    def on_nightly_toggle(self):
+        want = self.night_on.get()
+        if want and not schedule.valid_time(self.night_time.get()):
+            messagebox.showwarning("Ночной перезапуск", "Укажите время в формате ЧЧ:ММ, например 05:00")
+            self.night_on.set(False)
+            return
+        if self._need_admin():
+            self.night_on.set(not want)
+            return
+        if want and not messagebox.askyesno(
+                "Ночной перезапуск",
+                f"Будет создана задача Планировщика Windows: каждый день в {self.night_time.get().strip()} перезапускать службы ЕСМ "
+                "(Control Module, Local Module Controller, Orchestrator). Драйвер АТОЛ не затрагивается.\n\n"
+                "Если в это время идут проверки марок, программа подождёт паузы до часа и при продажах пропустит эту ночь. "
+                "Во время перезапуска (1–2 минуты) касса не сможет проверять марки.\n\nПродолжить?"):
+            self.night_on.set(False)
+            return
+        self._apply_nightly(want)
+
+    def on_nightly_time(self):
+        if not schedule.valid_time(self.night_time.get()):
+            messagebox.showwarning("Ночной перезапуск", "Укажите время в формате ЧЧ:ММ, например 05:00")
+            return
+        if not self.night_on.get():
+            messagebox.showinfo("Ночной перезапуск", "Сначала включите ночной перезапуск галочкой.")
+            return
+        if not self._need_admin():
+            self._apply_nightly(True)
+
+    def test_nightly(self):
+        """Репетиция: находит службы и смотрит, идут ли продажи, но ничего не перезапускает."""
+        def work():
+            lines: list[str] = []
+            code = scheduled.run(dry_run=True, cfg=self.app.cfg, say=lines.append, lock=False)
+            return code, lines
+
+        def done(res, err):
+            if err:
+                messagebox.showerror("Проверка ночного перезапуска", str(err))
+                return
+            code, lines = res
+            meaning = {0: "Всё готово: перезапуск пройдёт.", 3: "Сейчас идут продажи: в ночной запуск программа подождёт.",
+                       2: "Службы не найдены: проверьте scheduled_restart_chain в config.json."}.get(code, f"Код результата {code}.")
+            messagebox.showinfo("Проверка ночного перезапуска (службы не тронуты)", meaning + "\n\n" + "\n".join(lines))
+        self.app.bg(work, done)
 
     # ----- правила -----
 
